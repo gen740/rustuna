@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -16,6 +16,13 @@ use rustuna_core::Result;
 use rustuna_core::{Error, ErrorKind};
 
 const PARENT_CACHE_KEY_PREFIX: &str = "NSGAIISampler:parent:";
+
+#[derive(Default)]
+struct GenerationCache {
+    generation_to_trial_ids: Vec<Vec<u32>>,
+    child_generation: usize,
+    generation_to_parent_population: Vec<Vec<u32>>,
+}
 
 /// NSGA-II sampler for multi-objective optimization.
 ///
@@ -57,16 +64,18 @@ const PARENT_CACHE_KEY_PREFIX: &str = "NSGAIISampler:parent:";
 ///     Ok(())
 /// }
 /// ```
+
 pub struct NSGAIISampler {
     rng: Mutex<StdRng>,
     population_size: usize,
     mutation_prob: Option<f64>,
     crossover_prob: f64,
     swapping_prob: f64,
-    /// Cache mapping generation number to completed trial numbers in that generation.
+    /// Cache mapping generation number to completed trial IDs in that generation.
     /// Updated incrementally in `after_trial` so `sample_joint` does not scan all trials every time.
-    generation_to_numbers: RwLock<HashMap<u32, Vec<u32>>>,
+    generation_cache: RwLock<GenerationCache>,
 }
+
 impl Default for NSGAIISampler {
     fn default() -> Self {
         Self::new(50, None, 0.9, 0.5)
@@ -93,7 +102,7 @@ impl NSGAIISampler {
             mutation_prob,
             crossover_prob,
             swapping_prob,
-            generation_to_numbers: RwLock::new(HashMap::new()),
+            generation_cache: RwLock::new(GenerationCache::default()),
         }
     }
     /// Creates a reproducibly seeded NSGA-II sampler.
@@ -113,78 +122,49 @@ impl NSGAIISampler {
             mutation_prob,
             crossover_prob,
             swapping_prob,
-            generation_to_numbers: RwLock::new(HashMap::new()),
+            generation_cache: RwLock::new(GenerationCache::default()),
         }
     }
-    fn get_rng_lock(&self) -> Result<MutexGuard<'_, StdRng>> {
-        self.rng.lock().map_err(|e| {
-            Error::with_reason(
-                ErrorKind::SamplerError,
-                format!("Failed to acquire RNG guard: {e}"),
-            )
-        })
-    }
-    fn get_generation_to_numbers_read_lock(
-        &self,
-    ) -> Result<RwLockReadGuard<'_, HashMap<u32, Vec<u32>>>> {
-        self.generation_to_numbers.read().map_err(|e| {
-            Error::with_reason(
-                ErrorKind::SamplerError,
-                format!("Failed to acquire generation_to_numbers read guard: {e}"),
-            )
-        })
-    }
-    fn get_generation_to_numbers_write_lock(
-        &self,
-    ) -> Result<RwLockWriteGuard<'_, HashMap<u32, Vec<u32>>>> {
-        self.generation_to_numbers.write().map_err(|e| {
-            Error::with_reason(
-                ErrorKind::SamplerError,
-                format!("Failed to acquire generation_to_numbers write guard: {e}"),
-            )
-        })
-    }
+
     fn rebuild_generation_cache(&self, trials: &[Option<PersistedTrial>]) -> Result<()> {
-        let mut generation_to_numbers = self.get_generation_to_numbers_write_lock()?;
-        generation_to_numbers.clear();
-        let generation_key = AttrKey::System("generation".into());
-        for trial in trials.iter().flatten() {
-            if !matches!(trial.state_values, TrialStateValues::Complete(_)) {
+        let mut cache = self.generation_cache.write().unwrap();
+        cache.generation_to_trial_ids.clear();
+
+        let key = AttrKey::System("generation".into());
+        for trial in trials
+            .iter()
+            .flatten()
+            .filter(|trial| matches!(trial.state_values, TrialStateValues::Complete(_)))
+        {
+            let Some(generation) = trial.attrs.get(&key).and_then(|v| v.parse::<usize>().ok())
+            else {
                 continue;
-            }
-            if let Some(gen_str) = trial.attrs.get(&generation_key) {
-                if let Ok(generation) = gen_str.parse::<u32>() {
-                    generation_to_numbers
-                        .entry(generation)
-                        .or_default()
-                        .push(trial.number);
-                }
-            }
+            };
+
+            cache
+                .generation_to_trial_ids
+                .resize_with(generation + 1, Vec::new);
+            cache.generation_to_trial_ids[generation].push(trial.id);
         }
+
+        cache.child_generation = cache
+            .generation_to_trial_ids
+            .iter()
+            .take_while(|ids| ids.len() >= self.population_size)
+            .count();
+
         Ok(())
     }
+
     /// Builds the study-system-attribute key under which parent trial IDs for `generation`
     /// are persisted.
-    fn parent_cache_key(generation: u32) -> AttrKey {
+    fn parent_cache_key(generation: usize) -> AttrKey {
         AttrKey::System(format!("{PARENT_CACHE_KEY_PREFIX}{generation}").into())
     }
 
-    /// Encodes a list of trial numbers as a JSON array of trial IDs for persistence.
-    fn encode_parent_trial_ids(
-        trials: &[Option<PersistedTrial>],
-        population_numbers: &[u32],
-    ) -> Result<String> {
-        let trial_ids = population_numbers
-            .iter()
-            .map(|number| {
-                trials
-                    .get(*number as usize)
-                    .and_then(Option::as_ref)
-                    .map(|trial| trial.id)
-                    .ok_or_else(|| Error::new(ErrorKind::TrialDiscarded))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        serde_json::to_string(&trial_ids).map_err(|error| {
+    /// Encodes a list of parent trial IDs for persistence.
+    fn encode_parent_trial_ids(parent_ids: &[u32]) -> Result<String> {
+        serde_json::to_string(parent_ids).map_err(|error| {
             Error::with_reason(
                 ErrorKind::Unexpected,
                 format!("Failed to encode NSGA-II parent cache: {error}"),
@@ -192,12 +172,13 @@ impl NSGAIISampler {
         })
     }
 
-    /// Decodes a persisted JSON array of trial IDs back into trial numbers.
+    /// Decodes a persisted JSON array of trial IDs.
     ///
     /// Returns `None` when the cache is stale or incompatible with the current sampler,
     /// allowing the caller to fall back to full recomputation.
-    fn decode_parent_population_numbers(
-        completed_trial_numbers_by_id: &HashMap<u32, u32>,
+    fn decode_parent_trial_ids(
+        ctx: &Context,
+        storage: &dyn Storage,
         encoded: &str,
         population_size: usize,
     ) -> Result<Option<Vec<u32>>> {
@@ -210,156 +191,182 @@ impl NSGAIISampler {
         if trial_ids.len() != population_size {
             return Ok(None);
         }
-        let mut unique_trial_ids = trial_ids.clone();
-        unique_trial_ids.sort_unstable();
-        unique_trial_ids.dedup();
-        if unique_trial_ids.len() != trial_ids.len() {
-            return Ok(None);
-        }
-
-        let mut population_numbers = Vec::with_capacity(trial_ids.len());
-        for trial_id in trial_ids {
-            match completed_trial_numbers_by_id.get(&trial_id) {
-                Some(number) => population_numbers.push(*number),
-                None => return Ok(None),
+        for (index, trial_id) in trial_ids.iter().enumerate() {
+            if trial_ids[..index].contains(trial_id) {
+                return Ok(None);
+            }
+            let trial = match get_cached_trial_for_study(ctx, storage, *trial_id) {
+                Ok(trial) => trial,
+                Err(error)
+                    if matches!(
+                        &error.kind,
+                        ErrorKind::TrialNotFound | ErrorKind::TrialDiscarded
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if !matches!(trial.state_values, TrialStateValues::Complete(_)) {
+                return Ok(None);
             }
         }
-        Ok(Some(population_numbers))
+        Ok(Some(trial_ids))
     }
 
-    fn select_elite_population_numbers(
+    fn select_elite_population_ids(
         &self,
         ctx: &Context,
-        trials: &[Option<PersistedTrial>],
-        population_numbers: &[u32],
+        storage: &dyn Storage,
+        population_ids: &[u32],
     ) -> Result<Vec<u32>> {
-        let population_numbers_per_rank = fast_non_dominated_sort(ctx, trials, population_numbers)?;
+        let population_ids_per_rank = fast_non_dominated_sort(ctx, storage, population_ids)?;
 
-        let mut elite_population_numbers = vec![];
-        for population_numbers in population_numbers_per_rank {
-            if elite_population_numbers.len() + population_numbers.len() <= self.population_size {
-                elite_population_numbers.extend(population_numbers);
+        let mut elite_population_ids = vec![];
+        for population_ids in population_ids_per_rank {
+            if elite_population_ids.len() + population_ids.len() <= self.population_size {
+                elite_population_ids.extend(population_ids);
             } else {
-                let n = self.population_size - elite_population_numbers.len();
-                let crowding_sorted_population_numbers =
-                    crowding_distance_sort(ctx, trials, population_numbers)?;
-                elite_population_numbers.extend(&crowding_sorted_population_numbers[..n]);
+                let n = self.population_size - elite_population_ids.len();
+                let crowding_sorted_population_ids =
+                    crowding_distance_sort(ctx, storage, population_ids)?;
+                elite_population_ids.extend(&crowding_sorted_population_ids[..n]);
                 break;
             }
         }
-        Ok(elite_population_numbers)
+        Ok(elite_population_ids)
     }
-    fn get_child_generation(&self, trials: &[Option<PersistedTrial>]) -> Result<u32> {
+
+    fn get_child_generation(&self, trials: &[Option<PersistedTrial>]) -> Result<usize> {
         // TODO: Incrementally sync trials completed by other workers without a full rescan.
-        if self.get_generation_to_numbers_read_lock()?.is_empty() {
+        let needs_rebuild = self
+            .generation_cache
+            .read()
+            .unwrap()
+            .generation_to_trial_ids
+            .is_empty();
+        if needs_rebuild {
             self.rebuild_generation_cache(trials)?;
         }
 
-        let mut child_generation = 0u32;
-        loop {
-            let full = self
-                .get_generation_to_numbers_read_lock()?
-                .get(&child_generation)
-                .is_some_and(|numbers| numbers.len() >= self.population_size);
-            if !full {
-                break;
-            }
-            child_generation = child_generation.checked_add(1).ok_or_else(|| {
-                Error::with_reason(ErrorKind::Unexpected, "NSGA-II generation overflow")
-            })?;
+        let mut generation_cache = self.generation_cache.write().unwrap();
+        while generation_cache
+            .generation_to_trial_ids
+            .get(generation_cache.child_generation)
+            .is_some_and(|ids| ids.len() >= self.population_size)
+        {
+            generation_cache.child_generation += 1;
         }
-        Ok(child_generation)
+        Ok(generation_cache.child_generation)
     }
 
-    fn get_parent_population_numbers(
+    fn ensure_parent_population_cached(
         &self,
         ctx: &Context,
-        trials: &[Option<PersistedTrial>],
-        child_generation: u32,
-        get_cached_parent: impl Fn(u32) -> Option<String>,
-    ) -> Result<(u32, Vec<u32>, Attrs)> {
-        if child_generation == 0 {
-            return Ok((0, Vec::new(), Attrs::new()));
+        storage: &mut dyn Storage,
+        generation: usize,
+    ) -> Result<bool> {
+        let mut generation_cache = self.generation_cache.write().unwrap();
+
+        if generation_cache
+            .generation_to_parent_population
+            .get(generation)
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            return Ok(true);
         }
 
-        // TODO: Persist trial numbers with IDs to avoid rebuilding this map for every sample.
-        let completed_trial_numbers_by_id = trials
-            .iter()
-            .flatten()
-            .filter_map(|trial| {
-                matches!(trial.state_values, TrialStateValues::Complete(_))
-                    .then_some((trial.id, trial.number))
-            })
-            .collect::<HashMap<_, _>>();
+        let encoded = match storage.get_study_attr(ctx.study_id, Self::parent_cache_key(generation))
+        {
+            Ok(encoded) => encoded,
+            Err(_) => return Ok(false),
+        };
+
+        let Some(ids) =
+            Self::decode_parent_trial_ids(ctx, &*storage, &encoded, self.population_size)?
+        else {
+            return Ok(false);
+        };
+
+        if generation_cache.generation_to_parent_population.len() <= generation {
+            generation_cache
+                .generation_to_parent_population
+                .resize_with(generation + 1, Vec::new);
+        }
+        generation_cache.generation_to_parent_population[generation] = ids;
+
+        Ok(true)
+    }
+
+    fn get_parent_population_ids(
+        &self,
+        ctx: &Context,
+        storage: &mut dyn Storage,
+        child_generation: usize,
+    ) -> Result<(usize, Attrs)> {
+        if child_generation == 0 {
+            return Ok((0, Attrs::new()));
+        }
 
         // Try to restore the parent population from persisted cache.
-        if let Some(encoded) = get_cached_parent(child_generation) {
-            if let Some(numbers) = Self::decode_parent_population_numbers(
-                &completed_trial_numbers_by_id,
-                &encoded,
-                self.population_size,
-            )? {
-                return Ok((child_generation, numbers, Attrs::new()));
-            }
+        if self.ensure_parent_population_cached(ctx, storage, child_generation)? {
+            return Ok((child_generation, Attrs::new()));
         }
 
         // Cache miss or stale: find the most recent cached generation to start from.
-        let mut first_missing_generation = 1u32;
-        let mut parent_population_numbers = Vec::new();
+        let mut first_missing_generation = 1usize;
         for gen in (1..child_generation).rev() {
-            if let Some(encoded) = get_cached_parent(gen) {
-                if let Some(numbers) = Self::decode_parent_population_numbers(
-                    &completed_trial_numbers_by_id,
-                    &encoded,
-                    self.population_size,
-                )? {
-                    first_missing_generation = gen + 1;
-                    parent_population_numbers = numbers;
-                    break;
-                }
+            if self.ensure_parent_population_cached(ctx, storage, gen)? {
+                first_missing_generation = gen + 1;
+                break;
             }
         }
 
         // Recompute elite selection for each missing generation.
         let mut new_attrs = Attrs::new();
         for generation in first_missing_generation..=child_generation {
-            let population_numbers = match self
-                .get_generation_to_numbers_read_lock()?
-                .get(&(generation - 1))
-            {
-                Some(numbers) if numbers.len() >= self.population_size => numbers.clone(),
-                _ => break,
+            let candidates = {
+                let cache = self.generation_cache.read().unwrap();
+                let population_ids = &cache.generation_to_trial_ids[generation - 1];
+                if population_ids.len() < self.population_size {
+                    break;
+                }
+                let parent_ids: &[u32] = if generation > 1 {
+                    &cache.generation_to_parent_population[generation - 1]
+                } else {
+                    &[]
+                };
+                let mut candidates = Vec::with_capacity(population_ids.len() + parent_ids.len());
+                candidates.extend_from_slice(population_ids);
+                candidates.extend_from_slice(parent_ids);
+                candidates
             };
-
-            let mut candidates = population_numbers;
-            candidates.append(&mut parent_population_numbers);
-            parent_population_numbers =
-                self.select_elite_population_numbers(ctx, trials, &candidates)?;
-
-            let encoded = Self::encode_parent_trial_ids(trials, &parent_population_numbers)?;
+            let parent_population_ids =
+                self.select_elite_population_ids(ctx, &*storage, &candidates)?;
+            let encoded = Self::encode_parent_trial_ids(&parent_population_ids)?;
             new_attrs.insert(Self::parent_cache_key(generation), encoded);
+            let mut cache = self.generation_cache.write().unwrap();
+            if cache.generation_to_parent_population.len() <= generation {
+                cache
+                    .generation_to_parent_population
+                    .resize_with(generation + 1, Vec::new);
+            }
+            cache.generation_to_parent_population[generation] = parent_population_ids;
         }
-
-        Ok((child_generation, parent_population_numbers, new_attrs))
+        Ok((child_generation, new_attrs))
     }
-    fn crossover(
-        &self,
-        parent0: &HashMap<String, f64>,
-        parent1: &HashMap<String, f64>,
-        sorted_names: &[&str],
-    ) -> Result<HashMap<String, f64>> {
-        let mut child = HashMap::new();
-        for name in sorted_names {
-            let param_value0 = *parent0.get(*name).unwrap();
-            let param_value1 = *parent1.get(*name).unwrap();
-            let param_value = if self.get_rng_lock()?.gen_bool(self.swapping_prob) {
-                param_value1
+
+    fn crossover(&self, parent0: &[f64], parent1: &[f64]) -> Vec<f64> {
+        let mut child = Vec::with_capacity(parent0.len());
+        for (param_value0, param_value1) in parent0.iter().zip(parent1) {
+            let param_value = if self.rng.lock().unwrap().gen_bool(self.swapping_prob) {
+                *param_value1
             } else {
-                param_value0
+                *param_value0
             };
-            child.insert((*name).to_string(), param_value);
+            child.push(param_value);
         }
-        Ok(child)
+        child
     }
 }
 impl Sampler for NSGAIISampler {
@@ -374,7 +381,7 @@ impl Sampler for NSGAIISampler {
             return distribution.get_single_value();
         }
 
-        let mut rng = self.get_rng_lock()?;
+        let mut rng = self.rng.lock().unwrap();
         match distribution {
             Distribution::Float {
                 low,
@@ -451,18 +458,13 @@ impl Sampler for NSGAIISampler {
         let mut guard = storage
             .write()
             .map_err(|_e| Error::new(ErrorKind::Unexpected))?;
-        let (child_generation, parent_population_numbers, parent_cache_attrs) = {
+        let (child_generation, parent_cache_attrs) = {
             let child_generation = {
                 let trials = guard.get_trials(ctx.study_id)?;
                 self.get_child_generation(trials)?
             };
 
-            let study_attrs = guard.get_study(ctx.study_id)?.attrs.clone();
-
-            let trials = guard.get_trials(ctx.study_id)?;
-            self.get_parent_population_numbers(ctx, trials, child_generation, |gen| {
-                study_attrs.get(&Self::parent_cache_key(gen)).cloned()
-            })?
+            self.get_parent_population_ids(ctx, &mut *guard, child_generation)?
         };
         let mut attrs = Attrs::with_capacity(1);
         attrs.insert(
@@ -479,45 +481,47 @@ impl Sampler for NSGAIISampler {
             return Ok(HashMap::new());
         }
 
-        let (parent0_number, parent1_number) = {
-            let mut selected = parent_population_numbers
-                .choose_multiple(self.get_rng_lock()?.deref_mut(), 2)
+        let (parent0_id, parent1_id) = {
+            let generation_cache = self.generation_cache.read().unwrap();
+            let parent_population_ids = generation_cache
+                .generation_to_parent_population
+                .get(child_generation)
+                .filter(|ids| !ids.is_empty())
+                .ok_or_else(|| Error::new(ErrorKind::TrialDiscarded))?;
+            let mut selected = parent_population_ids
+                .choose_multiple(self.rng.lock().unwrap().deref_mut(), 2)
                 .copied();
-            let parent0_number = selected.next().ok_or_else(|| {
+            let parent0_id = selected.next().ok_or_else(|| {
                 Error::with_reason(
                     ErrorKind::SamplerError,
                     "NSGA-II requires at least two parent trials",
                 )
             })?;
-            let parent1_number = selected.next().ok_or_else(|| {
+            let parent1_id = selected.next().ok_or_else(|| {
                 Error::with_reason(
                     ErrorKind::SamplerError,
                     "NSGA-II requires at least two parent trials",
                 )
             })?;
-            (parent0_number, parent1_number)
+            (parent0_id, parent1_id)
         };
 
-        let trials = guard.get_trials(ctx.study_id)?;
         let sorted_names = sorted_parameter_names(search_space);
-        let build_parent_params = |number: u32| -> Result<HashMap<String, f64>> {
-            let trial = trials
-                .get(number as usize)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| Error::new(ErrorKind::TrialDiscarded))?;
-            let mut params = HashMap::with_capacity(search_space.len());
+        let build_parent_params = |id: u32| -> Result<Vec<f64>> {
+            let trial = guard.get_cached_trial(id)?;
+            let mut params = Vec::with_capacity(search_space.len());
             for name in &sorted_names {
                 let param_value = *trial.internal_params.get(*name).unwrap();
-                params.insert((*name).to_string(), param_value);
+                params.push(param_value);
             }
             Ok(params)
         };
-        let parent0 = build_parent_params(parent0_number)?;
-        let parent1 = build_parent_params(parent1_number)?;
+        let parent0 = build_parent_params(parent0_id)?;
+        let parent1 = build_parent_params(parent1_id)?;
         drop(guard);
 
-        let child = if self.get_rng_lock()?.gen_bool(self.crossover_prob) {
-            self.crossover(&parent0, &parent1, &sorted_names)?
+        let child = if self.rng.lock().unwrap().gen_bool(self.crossover_prob) {
+            self.crossover(&parent0, &parent1)
         } else {
             parent0
         };
@@ -527,9 +531,9 @@ impl Sampler for NSGAIISampler {
             .unwrap_or(1.0 / 1.0_f64.max(child.len() as f64));
         let mut params = HashMap::new();
 
-        for name in &sorted_names {
-            if !self.get_rng_lock()?.gen_bool(mutation_prob) {
-                let param_value = *child.get(*name).unwrap();
+        for (index, name) in sorted_names.iter().enumerate() {
+            if !self.rng.lock().unwrap().gen_bool(mutation_prob) {
+                let param_value = child[index];
                 params.insert((*name).to_string(), param_value);
             }
         }
@@ -548,14 +552,17 @@ impl Sampler for NSGAIISampler {
                 .map_err(|_e| Error::new(ErrorKind::Unexpected))?;
             let trial = guard.get_trial(ctx.trial_id)?;
             let generation_key = AttrKey::System("generation".into());
-            if let Some(gen_str) = trial.attrs.get(&generation_key) {
-                if let Ok(generation) = gen_str.parse::<u32>() {
-                    let mut generation_to_numbers = self.get_generation_to_numbers_write_lock()?;
-                    generation_to_numbers
-                        .entry(generation)
-                        .or_default()
-                        .push(trial.number);
-                }
+
+            if let Some(generation) = trial
+                .attrs
+                .get(&generation_key)
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                let mut cache = self.generation_cache.write().unwrap();
+                cache
+                    .generation_to_trial_ids
+                    .resize_with(generation + 1, Vec::new);
+                cache.generation_to_trial_ids[generation].push(trial.id);
             }
         }
         Ok(())
@@ -580,8 +587,6 @@ fn sorted_parameter_names(search_space: &HashMap<String, Distribution>) -> Vec<&
 /// 1) Trial x is feasible and trial y is not.
 /// 2) Trial x and y are both infeasible, but solution x has a smaller overall constraint
 ///    violation.
-/// 3) Trial x and y are feasible and trial x dominates trial y.
-///
 fn constrained_dominates(
     values_feasible_violation_0: &Option<(&[f64], bool, f64)>,
     values_feasible_violation_1: &Option<(&[f64], bool, f64)>,
@@ -605,21 +610,39 @@ fn constrained_dominates(
     }
 }
 
+fn get_cached_trial_for_study<'a>(
+    ctx: &Context,
+    storage: &'a dyn Storage,
+    trial_id: u32,
+) -> Result<&'a PersistedTrial> {
+    let trial = match storage.get_cached_trial(trial_id) {
+        Ok(trial) => trial,
+        Err(error)
+            if matches!(
+                &error.kind,
+                ErrorKind::TrialNotFound | ErrorKind::TrialDiscarded
+            ) =>
+        {
+            return Err(Error::new(ErrorKind::TrialDiscarded));
+        }
+        Err(error) => return Err(error),
+    };
+    if trial.study_id != ctx.study_id {
+        return Err(Error::new(ErrorKind::TrialDiscarded));
+    }
+    Ok(trial)
+}
+
 fn fast_non_dominated_sort(
     ctx: &Context,
-    trials: &[Option<PersistedTrial>],
-    population_numbers: &[u32],
+    storage: &dyn Storage,
+    population_ids: &[u32],
 ) -> Result<Vec<Vec<u32>>> {
-    let n = population_numbers.len();
+    let n = population_ids.len();
 
-    let population_trials = population_numbers
+    let population_trials = population_ids
         .iter()
-        .map(|i| {
-            trials
-                .get(*i as usize)
-                .and_then(|trial| trial.as_ref())
-                .ok_or_else(|| Error::new(ErrorKind::TrialDiscarded))
-        })
+        .map(|id| get_cached_trial_for_study(ctx, storage, *id))
         .collect::<Result<Vec<_>>>()?;
 
     validate_trials(&population_trials, &ctx.directions)?;
@@ -637,7 +660,7 @@ fn fast_non_dominated_sort(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut dominated_count = vec![0u32; n];
+    let mut dominated_count = vec![0usize; n];
     let mut dominates_list: Vec<Vec<usize>> = vec![vec![]; n];
 
     for i in 0..n {
@@ -656,7 +679,7 @@ fn fast_non_dominated_sort(
         }
     }
 
-    let mut population_numbers_per_rank = vec![];
+    let mut population_ids_per_rank = vec![];
     let mut mutable_population_indices: Vec<usize> = (0..n).collect();
     while !mutable_population_indices.is_empty() {
         let mut non_dominated_indices = vec![];
@@ -679,28 +702,25 @@ fn fast_non_dominated_sort(
                 dominated_count[y] -= 1;
             }
         }
-        population_numbers_per_rank.push(
+        population_ids_per_rank.push(
             non_dominated_indices
                 .into_iter()
-                .map(|idx| population_numbers[idx])
+                .map(|idx| population_ids[idx])
                 .collect(),
         );
     }
-    Ok(population_numbers_per_rank)
+    Ok(population_ids_per_rank)
 }
 
 fn calc_crowding_distance(
     ctx: &Context,
-    trials: &[Option<PersistedTrial>],
-    population_numbers: &[u32],
+    storage: &dyn Storage,
+    population_ids: &[u32],
 ) -> Result<Vec<(u32, f64)>> {
-    let population_values = population_numbers
+    let population_values = population_ids
         .iter()
-        .map(|n| {
-            let trial = trials
-                .get(*n as usize)
-                .and_then(|trial| trial.as_ref())
-                .ok_or_else(|| Error::new(ErrorKind::TrialDiscarded))?;
+        .map(|id| {
+            let trial = get_cached_trial_for_study(ctx, storage, *id)?;
             match &trial.state_values {
                 TrialStateValues::Complete(values) => Ok(values.clone()),
                 _ => Ok(vec![f64::NAN; ctx.directions.len()]),
@@ -708,42 +728,47 @@ fn calc_crowding_distance(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut crowding_distance = vec![0.0; population_numbers.len()];
+    let mut crowding_distance = vec![0.0; population_ids.len()];
 
     for i in 0..ctx.directions.len() {
-        let mut indices_and_values = (0..population_numbers.len())
-            .zip(population_values.iter().map(|v| v[i]))
+        let mut indices_and_values = [(usize::MAX, -f64::INFINITY)]
+            .into_iter()
+            .chain((0..population_ids.len()).zip(population_values.iter().map(|v| v[i])))
+            .chain([(usize::MAX, f64::INFINITY)])
             .collect::<Vec<_>>();
-        indices_and_values.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let population_values = &mut indices_and_values[1..=population_ids.len()];
+        population_values.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-        if indices_and_values[0].1 == indices_and_values[population_numbers.len() - 1].1 {
+        if population_values[0].1 == population_values[population_ids.len() - 1].1 {
             continue;
         }
 
-        let values = [-f64::INFINITY]
-            .into_iter()
-            .chain(indices_and_values.iter().map(|t| t.1))
-            .chain([f64::INFINITY])
-            .collect::<Vec<_>>();
-
-        let min_value = values.iter().cloned().find(|v| v.is_finite()).unwrap();
-        let max_value = values.iter().cloned().rfind(|v| v.is_finite()).unwrap();
+        let min_value = population_values
+            .iter()
+            .map(|&(_, value)| value)
+            .find(|value| value.is_finite())
+            .unwrap();
+        let max_value = population_values
+            .iter()
+            .map(|&(_, value)| value)
+            .rfind(|value| value.is_finite())
+            .unwrap();
 
         let mut width = max_value - min_value;
         if width <= 0.0 {
             width = 1.0;
         }
 
-        for j in 0..indices_and_values.len() {
-            let gap = if values[j] == values[j + 2] {
+        for window in indices_and_values.windows(3) {
+            let gap = if window[0].1 == window[2].1 {
                 0.0
             } else {
-                values[j + 2] - values[j]
+                window[2].1 - window[0].1
             };
-            crowding_distance[indices_and_values[j].0] += gap / width;
+            crowding_distance[window[1].0] += gap / width;
         }
     }
-    Ok(population_numbers
+    Ok(population_ids
         .iter()
         .copied()
         .zip(crowding_distance)
@@ -752,14 +777,14 @@ fn calc_crowding_distance(
 
 fn crowding_distance_sort(
     ctx: &Context,
-    trials: &[Option<PersistedTrial>],
-    population_numbers: Vec<u32>,
+    storage: &dyn Storage,
+    population_ids: Vec<u32>,
 ) -> Result<Vec<u32>> {
-    let mut population_and_distance = calc_crowding_distance(ctx, trials, &population_numbers)?;
+    let mut population_and_distance = calc_crowding_distance(ctx, storage, &population_ids)?;
     population_and_distance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     Ok(population_and_distance
         .into_iter()
-        .map(|(number, _)| number)
+        .map(|(id, _)| id)
         .collect())
 }
 
@@ -1111,17 +1136,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_population_cache_preserves_parent_order() {
-        let completed_trial_numbers_by_id = HashMap::from([(10, 2), (20, 0), (30, 1)]);
-        let population_numbers = NSGAIISampler::decode_parent_population_numbers(
-            &completed_trial_numbers_by_id,
-            "[10,20,30]",
-            3,
-        )
-        .unwrap()
-        .unwrap();
+    fn test_parent_population_cache_preserves_parent_order() -> Result<()> {
+        let mut storage = InMemoryStorage::new();
+        storage.insert_study_with_id(0, "parent-cache-order", vec![Direction::Minimize])?;
+        for (id, number) in [(10, 0), (20, 1), (30, 2)] {
+            storage.insert_trial_with_id(0, id, number)?;
+            storage.set_trial_state_values(id, TrialStateValues::Complete(vec![id as f64]))?;
+        }
+        let ctx = Context {
+            study_id: 0,
+            directions: vec![Direction::Minimize],
+            trial_number: 0,
+            trial_id: 10,
+        };
+        let population_ids =
+            NSGAIISampler::decode_parent_trial_ids(&ctx, &storage, "[10,20,30]", 3)?.unwrap();
 
-        assert_eq!(population_numbers, vec![2, 0, 1]);
+        assert_eq!(population_ids, vec![10, 20, 30]);
+        Ok(())
     }
 
     #[test]

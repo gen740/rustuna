@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">NSGA-II benchmark: PR 238 and PR 237 cache variants</title>
+  <desc id="desc">Mean elapsed time on a log-log chart and overhead relative to PR 238 only.</desc>
+  <rect width="1200" height="720" fill="#ffffff"/>
+  <text x="600" y="38" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="24" font-weight="700" fill="#172033">NSGA-II benchmark</text>
+  <text x="600" y="66" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="14" fill="#536176">40 parameters · 2 objectives · release wheel · mean of 3 runs</text>
+
+  <!-- Left: runtime -->
+  <rect x="55" y="82" width="570" height="505" rx="8" fill="#f8fafc" stroke="#d7dee8"/>
+  <text x="340" y="112" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="17" font-weight="700" fill="#172033">Elapsed time (log-log)</text>
+  <g stroke="#dfe5ed" stroke-width="1">
+    <line x1="80" y1="99" x2="580" y2="99"/>
+    <line x1="80" y1="191" x2="580" y2="191"/>
+    <line x1="80" y1="283" x2="580" y2="283"/>
+    <line x1="80" y1="375" x2="580" y2="375"/>
+    <line x1="80" y1="467" x2="580" y2="467"/>
+    <line x1="80" y1="559" x2="580" y2="559"/>
+    <line x1="80" y1="120" x2="80" y2="559"/>
+    <line x1="205" y1="120" x2="205" y2="559"/>
+    <line x1="330" y1="120" x2="330" y2="559"/>
+    <line x1="455" y1="120" x2="455" y2="559"/>
+    <line x1="580" y1="120" x2="580" y2="559"/>
+  </g>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" fill="#536176">
+    <text x="72" y="103" text-anchor="end">10</text>
+    <text x="72" y="195" text-anchor="end">1</text>
+    <text x="72" y="287" text-anchor="end">0.1</text>
+    <text x="72" y="379" text-anchor="end">0.01</text>
+    <text x="72" y="471" text-anchor="end">0.001</text>
+    <text x="72" y="563" text-anchor="end">0.0001</text>
+    <text x="80" y="578" text-anchor="middle">10</text>
+    <text x="205" y="578" text-anchor="middle">100</text>
+    <text x="330" y="578" text-anchor="middle">1k</text>
+    <text x="455" y="578" text-anchor="middle">10k</text>
+    <text x="580" y="578" text-anchor="middle">100k</text>
+    <text x="330" y="606" text-anchor="middle">number of trials</text>
+    <text x="20" y="340" text-anchor="middle" transform="rotate(-90 20 340)">seconds</text>
+  </g>
+  <polyline points="80,511.1 205,419.4 330,320.7 455,224.1 580,106.9" fill="none" stroke="#2563eb" stroke-width="3"/>
+  <polyline points="80,512.5 205,419.5 330,320.9 455,222.5 580,105.5" fill="none" stroke="#d97706" stroke-width="3"/>
+  <polyline points="80,511.7 205,419.0 330,318.3 455,223.3 580,106.6" fill="none" stroke="#059669" stroke-width="3"/>
+  <g fill="#2563eb"><circle cx="80" cy="511.1" r="4"/><circle cx="205" cy="419.4" r="4"/><circle cx="330" cy="320.7" r="4"/><circle cx="455" cy="224.1" r="4"/><circle cx="580" cy="106.9" r="4"/></g>
+  <g fill="#d97706"><circle cx="80" cy="512.5" r="4"/><circle cx="205" cy="419.5" r="4"/><circle cx="330" cy="320.9" r="4"/><circle cx="455" cy="222.5" r="4"/><circle cx="580" cy="105.5" r="4"/></g>
+  <g fill="#059669"><circle cx="80" cy="511.7" r="4"/><circle cx="205" cy="419.0" r="4"/><circle cx="330" cy="318.3" r="4"/><circle cx="455" cy="223.3" r="4"/><circle cx="580" cy="106.6" r="4"/></g>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13">
+    <line x1="100" y1="132" x2="130" y2="132" stroke="#2563eb" stroke-width="3"/><text x="138" y="137" fill="#172033">#238 only</text>
+    <line x1="230" y1="132" x2="260" y2="132" stroke="#d97706" stroke-width="3"/><text x="268" y="137" fill="#172033">#238 + #237 HashSet</text>
+    <line x1="430" y1="132" x2="460" y2="132" stroke="#059669" stroke-width="3"/><text x="468" y="137" fill="#172033">#238 + #237 Vec</text>
+  </g>
+
+  <!-- Right: overhead -->
+  <rect x="655" y="82" width="490" height="505" rx="8" fill="#f8fafc" stroke="#d7dee8"/>
+  <text x="900" y="112" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="17" font-weight="700" fill="#172033">Overhead vs #238 only</text>
+  <g stroke="#dfe5ed" stroke-width="1">
+    <line x1="690" y1="148" x2="1110" y2="148"/>
+    <line x1="690" y1="344" x2="1110" y2="344" stroke="#7d8ba1" stroke-width="2"/>
+    <line x1="690" y1="540" x2="1110" y2="540"/>
+  </g>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="12" fill="#536176">
+    <text x="682" y="152" text-anchor="end">+5%</text>
+    <text x="682" y="348" text-anchor="end">0%</text>
+    <text x="682" y="544" text-anchor="end">−5%</text>
+    <text x="730" y="560" text-anchor="middle">10</text>
+    <text x="825" y="560" text-anchor="middle">100</text>
+    <text x="920" y="560" text-anchor="middle">1k</text>
+    <text x="1015" y="560" text-anchor="middle">10k</text>
+    <text x="1110" y="560" text-anchor="middle">100k</text>
+    <text x="900" y="606" text-anchor="middle">number of trials</text>
+  </g>
+  <!-- scale: 39.2 px per percentage point, zero at y=344 -->
+  <g fill="#d97706">
+    <rect x="718" y="344" width="15" height="173" rx="2"/>
+    <rect x="813" y="333.1" width="15" height="10.9" rx="2"/>
+    <rect x="908" y="324.4" width="15" height="19.6" rx="2"/>
+    <rect x="1003" y="285.7" width="15" height="58.3" rx="2"/>
+    <rect x="1098" y="295.2" width="15" height="48.8" rx="2"/>
+  </g>
+  <g fill="#059669">
+    <rect x="735" y="344" width="15" height="63.6" rx="2"/>
+    <rect x="830" y="270.7" width="15" height="73.3" rx="2"/>
+    <rect x="925" y="133.1" width="15" height="210.9" rx="2"/>
+    <rect x="1020" y="297.2" width="15" height="46.8" rx="2"/>
+    <rect x="1115" y="319.6" width="15" height="24.4" rx="2"/>
+  </g>
+  <g font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13">
+    <rect x="770" y="132" width="14" height="14" rx="2" fill="#d97706"/><text x="792" y="144" fill="#172033">HashSet</text>
+    <rect x="860" y="132" width="14" height="14" rx="2" fill="#059669"/><text x="882" y="144" fill="#172033">Vec rebuild</text>
+  </g>
+  <text x="900" y="660" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="13" fill="#536176">Positive means slower than #238 only; differences are small in this sequential workload.</text>
+</svg>
